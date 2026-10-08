@@ -1,0 +1,141 @@
+
+Elsevier logo
+Journals & Books
+
+Help
+Search
+My account
+Sign in
+Purchase PDF
+Article preview
+Abstract
+Introduction
+Section snippets
+References (15)
+Elsevier
+Sustainable Computing: Informatics and Systems
+Volume 51, September 2026, 101407
+Sustainable Computing: Informatics and Systems
+CARA: Adaptive scheduling for carbon-efficient workload orchestration in distributed cloud systems
+Author links open overlay panel
+Kai Wen Liow
+, 
+Ruizhuo Wang
+, 
+Runna Zheng
+, 
+Hossain Akter
+, 
+Bangning Huang
+, 
+Hema Subramaniam
+
+Show more
+
+Add to Mendeley
+
+Share
+
+Cite
+https://doi.org/10.1016/j.suscom.2026.101407
+Get rights and content
+Highlights
+•
+Proposed CARA: a joint spatio-temporal carbon-aware scheduling architecture.
+•
+Achieved 75.7% carbon reduction via real-time Marginal Emissions Rate data.
+•
+Features a Multi-Objective Optimization engine with 0.54 s scheduling overhead.
+•
+Introduces a Spatio-Temporal Efficiency Ratio for environmental ROI analysis.
+•
+Provides cryptographically signed manifests for auditable green computing.
+Abstract
+The exponential growth of cloud computing has made data center energy consumption a critical environmental challenge, currently accounting for nearly 2% of global electricity use. Despite this, existing cloud infrastructures rely on static, carbon-agnostic scheduling that fails to consider the significant temporal and spatial variability of grid carbon intensity. This paper proposes and evaluates the Context-Aware and Adaptive Resource Allocation (CARA) architecture, a system designed to decouple compute growth from environmental impact. The methodology involves an event-driven architecture that integrates real-time Marginal Emissions Rate (MER) forecasts into a Multi-Objective Optimization (MOO) engine to perform joint spatio-temporal shifting of asynchronous workloads. To evaluate this framework, a prototype was developed using Python 3.9, the ElectricityMap API for real-time grid data, and an emulated cloud execution model. The empirical results demonstrate that CARA achieves a 75.7% reduction in carbon footprint compared to carbon-agnostic baseline schedulers. This significant reduction was achieved under a 12-hour MaxLatency constraints for asynchronous workloads, specifically by exploiting the carbon intensity arbitrage between fossil-fuel-intensive local grids and globally optimal regions during peak renewable penetration windows. Furthermore, the system maintains a negligible scheduling overhead of just 0.54 s and validates a Spatio-Temporal Efficiency Ratio that quantifies the environmental return on latency. These findings confirm that carbon-aware scheduling is a high-impact, low-cost architectural principle that can effectively mitigate the environmental burden of digital infrastructure.
+Introduction
+The rapid expansion of cloud computing, large-scale data analytics, and AI workloads has led to an accelerating rise in global data-center electricity consumption, reaching approximately 415 TWh in 2024 [4]. This trend is not merely a technical concern but a significant societal challenge, as data centers now represent about 1.5–1.7% of global electricity demand, with projections suggesting a doubling of this demand by 2030 [14]. The resulting greenhouse gas (GHG) emissions from this infrastructure have become a focal point for corporate sustainability reporting. Addressing this energy consumption is vital for global climate-mitigation goals, as the regional concentration of compute power imposes immense pressure on local grids and increases avoidable carbon footprint of digital services.
+According to Cozzi et al. [4], data centers are projected to become a dominant driver of electricity demand growth across major economies, particularly in the United States and Japan, where they may account for nearly half of the total growth through 2030. In the United States alone, recent energy usage reports indicate that data center power requirements are outpacing initial efficiency gains as AI integration deepens [13]. This underscores the scale and urgency of the problem, highlighting that the expansion of digital services is directly linked to the stability and the aggregated emissions of national power systems.
+A key concept in addressing this challenge is Carbon-Aware Computing, which involves aligning digital demand with the availability of clean energy. Traditional scheduling mechanisms are carbon-agnostic, meaning they dispatch workloads immediately without considering the carbon intensity of the electricity being consumed. This is problematic because grid cleanliness fluctuates dramatically; carbon intensity can vary by as much as 460 gCO₂/kWh within a single day depending on the energy mix [4].
+Connecting to the issue of grid variability is the concept of Marginal Emissions Rate (MER), which measures the emissions impact of an incremental change in electricity demand. While many systems utilize average carbon intensity for historical accounting, MER is prioritized in this work because it identifies the specific "peaking" power plants that must ramp up or down to meet software loads, thereby capturing the true marginal impact of scheduling decisions. By utilizing MER forecasts, systems can perform Temporal and Spatial Shifting to move workloads to times or regions where renewable energy penetration is highest. While studies have shown that shifting asynchronous workloads can reduce a task’s carbon footprint by approximately 5% while respecting deadlines [15], the industry still lacks a standardized, automated architecture to implement this at scale.
+To the best of our knowledge, joint spatio-temporal optimization has not yet been included as a standard control-plane feature in general-purpose cloud integrators. A significant quantitative gap remains in existing literature; for instance, while frameworks like CarbonFlex achieve a 57.5% reduction in emissions through temporal shifting [6], they remain spatially constrained. By failing to integrate spatial mobility, existing systems miss an estimated 20–25% of additional abatement potential available through regional carbon intensity arbitrage. So far, most studies have focused either on purely temporal shifting within a single cluster or purely spatial placement without dynamic forecast integration [10]. Furthermore, many existing solutions operate at an aggregate load level rather than providing per-task latency and carbon footprint targets, which often makes these methods unpractical for diverse, asynchronous enterprise workloads.
+The fundamental problem addressed in this research is that existing cloud orchestration frameworks treat computational resources as geographically and temporally static, leading to significant avoidable emissions because they cannot simultaneously exploit spatial and temporal arbitrage based on marginal grid signals. Consequently, the primary research objective is to develop and evaluate a modular, automated architecture that leverages real-time MER forecasts to perform joint spatio-temporal optimization, thereby minimizing a task's carbon footprint while strictly adhering to application-specific latency constraints.
+Unlike prior carbon-aware frameworks such as CarbonFlex and CA-SDK, which primarily provide policy guidance or developer-level abstractions, CARA introduces an end-to-end, event-driven scheduling architecture that embeds real-time marginal emissions intelligence directly into the orchestration layer. CARA uniquely formulates workload placement as a multi-objective optimization problem, balancing carbon footprint reduction, latency tolerance, and scheduling overhead, and introduces a novel Spatio-Temporal Efficiency Ratio to quantify the environmental return on execution delay. To evaluate the impact of real-time environmental metrics on cloud orchestration, this study formally tests the following hypothesis:
+•
+Null Hypothesis (
+): The integration of real-time environmental metrics into a Multi-Objective Optimization (MOO) framework does not result in a significant reduction in carbon footprint compared to carbon-agnostic baselines, or it fails to maintain compliance with established Service Level Agreements (SLAs).
+•
+Alternative Hypothesis (
+): The CARA architecture, utilizing a MOO framework, yields a statistically significant carbon reduction, exceeding a 50% threshold, while strictly adhering to SLA-defined latency constraints.
+We evaluate these hypotheses through a prototype that simulates diverse batch workloads across multiple AWS regions, specifically targeting the arbitrage between coal-heavy and renewable-rich grids.
+The data clearly shows that the CARA architecture successfully reduced the carbon footprint of model-training workloads by 75.7% compared to traditional baseline schedulers. This optimization was achieved under a 12-hour max latency window with a negligible performance overhead, proving that the system can effectively convert slack time in asynchronous tasks into verifiable emissions savings. Additionally, the system demonstrated technical robustness by generating cryptographically signed execution manifests, ensuring that green computing claims are auditable.
+There are several contributions this study makes; primarily, this study proposes a novel modular, cloud-agnostic architecture that uniquely integrates MER ingestion, MOO-based decision-making, and deferred execution using native cloud schedulers like AWS EventBridge [1]. This research advances the understanding of how Carbon Intensity Arbitrage can be automated within the software lifecycle. By treating the carbon footprint as a first-class scheduling constraint, CARA provides a practical blueprint for the next generation of sustainable distributed systems.
+Access through your organization
+Check access to the full text by signing in through your organization.
+
+Section snippets
+Related works
+The development of carbon-aware computing has seen significant progress through various industry and academic solutions. One prominent approach is Carbon-Intelligent Compute Management (CICS), which pioneered the use of Virtual Capacity Curves (VCCs) to shape flexible demand based on day-ahead carbon intensity forecasts and cluster-level demand predictions. This system demonstrates that temporal load shifting at a fleet scale is highly practical for asynchronous workloads such as batch data
+Context-Aware and Adaptive Resource Allocation (CARA) architecture
+The CARA architecture follows a modular, event-driven design, separating the carbon sensing logic from the execution infrastructure. It is composed of three distinct functional layers: Data Ingestion, the Control Plane (Orchestration), and Execution Fig. 1.
+Statistical validation and sensitivity framework
+To address the generalizability of the architecture, we utilize the 3-hour 'Model-Training' profile as our primary benchmark. To validate the system's robustness across the workload spectrum (Sensitivity Analysis), we introduced two additional archetypes: a 1-hour 'Data-Ingestion' task and a 6-hour 'Video-Processing' task. Statistical validation involved calculating the mean reduction, standard deviation (
+), and 95% Confidence Intervals across these profiles. This approach allows for a
+Result and discussion
+The evaluation of the CARA architecture focuses on the optimization magnitude, the computational cost of green logic, and the auditability of the resulting decisions. The empirical results, derived from a 3-hour model-training workload simulation across four global AWS regions, validate the feasibility of decoupling compute demand from grid carbon intensity.
+Conclusion and future works
+This study demonstrates that the Context-Aware and Adaptive Resource Allocation (CARA) architecture successfully decouples compute demand from grid carbon intensity by treating operational slack in asynchronous, delay-tolerant workloads as a flexible environmental asset. Beyond the empirical achievement of a 75.7% reduction in carbon footprint, the research synthesizes a critical shift in cloud orchestration: the transition from "follow-the-data" to "follow-the-renewables" paradigm. By
+Declaration of Competing Interest
+The authors declare that they have no known competing financial interests or personal relationships that could have appeared to influence the work reported in this paper
+References (15)
+S. Koebrich et al.
+Towards objective evaluation of the accuracy of marginal emissions factors
+Renew. Sustain. Energy Rev.
+(2025)
+W. Lin et al.
+A systematic review of green-aware management techniques for sustainable data center
+Sustain. Comput. Inform. Syst.
+(2024)
+M.T. Takci et al.
+Data centres as a source of flexibility for power systems
+Energy Rep.
+(2025)
+H. Allam
+Cloud-native reliability: applying sre to serverless and event-driven architectures
+Int. J. Artif. Intell. Data Sci. Mach. Learn.
+(2024)
+N. Asadov et al.
+Carbon-aware spatio-temporal workload shifting in edge–cloud environments: a review and novel algorithm
+Sustainability
+(2025)
+T. Bahreini et al.
+A carbon-aware workload dispatcher in cloud computing systems
+IEEE 16th Int. Conf. CLOUD Comput. (CLOUD)
+(2023)
+Cozzi, L., Spence, T., Singh, S., 2025. Energy and AI. Technical Report. International Energy Agency...
+There are more references available in the full text version of this article.
+Cited by (0)
+View full text
+© 2026 Elsevier Inc. All rights are reserved, including those for text and data mining, AI training, and similar technologies.
+
+Recommended articles
+The Fast-Greedy algorithm reveals hourly fluctuations and associated risks of shark communities in a South Pacific city
+Ecological Informatics, Volume 90, 2025, Article 103263
+Ibtissam Chafia, …, Laurent Vigliola
+Grid-cognizant TSO and DSO coordination framework for active and reactive power flexibility exchange: The Swiss case study
+Electric Power Systems Research, Volume 235, 2024, Article 110747
+Mohsen Kalantar-Neyestanaki, Rachid Cherkaoui
+Regularized reconciliation of hierarchical forecasts with application to building electricity demand
+Energy and Buildings, Volume 351, 2026, Article 116711
+Daniela Stoian, …, Vangelis Marinakis
+
+Show 3 more articles
+Elsevier logo with wordmark
+About ScienceDirect
+Remote access
+Contact and support
+Terms and conditions
+Privacy policy
+Cookie settings
+All content on this site: Copyright © 2026 Elsevier B.V., its licensors, and contributors. All rights are reserved, including those for text and data mining, AI training, and similar technologies. For all open access content, the relevant licensing terms apply.
+
+RELX group home page
