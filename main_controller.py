@@ -22,6 +22,10 @@ from config import (
     DENSITY_THRESHOLD,
     CARBON_HIGH,
     CARBON_LOW,
+    DEMO_MODE,
+    DEMO_CARBON_3AM,
+    DEMO_CARBON_9AM,
+    IMG_SIZE,
 )
 from orchestrator import predict_carbon, choose_mode, get_mode_metadata, log_decision
 
@@ -72,8 +76,11 @@ def main():
     current_sim_hour = -1
     current_carbon = 250.0
     cached_vehicle_count = 0
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 480.0
 
     print("🚀 Starting video analysis pipeline with dynamic carbon orchestration...")
+    if DEMO_MODE:
+        print("[INFO] DEMO_MODE active: progress < 0.5 -> 3 AM (300 gCO2/kWh), progress >= 0.5 -> 9 AM (300 gCO2/kWh)")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -81,17 +88,22 @@ def main():
             break
 
         frame_idx += 1
-        # Synchronized simulated clock matching app.py
-        simulated_hour = (frame_idx // 20) % 24
+        pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        progress = pos / total_frames if total_frames > 0 else 0.0
 
-        # Predict carbon once per simulated hour
-        if simulated_hour != current_sim_hour:
-            current_sim_hour = simulated_hour
-            current_carbon = predict_carbon(
-                predictor,
-                hour=simulated_hour,
-                fallback=hourly_fallback.get(simulated_hour, 250.0),
-            )
+        # Determine simulated hour and carbon
+        if DEMO_MODE:
+            simulated_hour = 3 if progress < 0.5 else 9
+            current_carbon = DEMO_CARBON_3AM if progress < 0.5 else DEMO_CARBON_9AM
+        else:
+            simulated_hour = (frame_idx // 20) % 24
+            if simulated_hour != current_sim_hour:
+                current_sim_hour = simulated_hour
+                current_carbon = predict_carbon(
+                    predictor,
+                    hour=simulated_hour,
+                    fallback=hourly_fallback.get(simulated_hour, 250.0),
+                )
 
         # Pre-resize frame to standard 640x360
         frame_resized = cv2.resize(frame, (640, 360))
@@ -113,7 +125,7 @@ def main():
                 current_mode = new_mode
 
             active_model = light_model if current_mode == "eco" else heavy_model
-            results = active_model(frame_resized, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
+            results = active_model(frame_resized, imgsz=IMG_SIZE, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
             boxes = results[0].boxes
             cached_vehicle_count = len(boxes)
 

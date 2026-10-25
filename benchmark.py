@@ -14,6 +14,7 @@ from config import (
     LIGHT_MODEL_PATH,
     DEFAULT_VIDEO_PATH,
     VEHICLE_CLASSES,
+    IMG_SIZE,
     LOGS_DIR,
 )
 
@@ -78,14 +79,14 @@ def run_benchmark(
 
         # 1. Benchmark Heavy Model
         t0 = time.perf_counter()
-        res_heavy = heavy_model(frame_resized, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
+        res_heavy = heavy_model(frame_resized, imgsz=IMG_SIZE, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
         t1 = time.perf_counter()
         heavy_latencies.append((t1 - t0) * 1000.0)
         heavy_counts.append(len(res_heavy[0].boxes))
 
         # 2. Benchmark Light Model
         t2 = time.perf_counter()
-        res_light = light_model(frame_resized, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
+        res_light = light_model(frame_resized, imgsz=IMG_SIZE, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
         t3 = time.perf_counter()
         light_latencies.append((t3 - t2) * 1000.0)
         light_counts.append(len(res_light[0].boxes))

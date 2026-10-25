@@ -15,6 +15,8 @@ def test_index_route(client):
     html = response.data.decode("utf-8")
     assert "EcoStream: Explainable Runtime Orchestrator" in html
     assert "chart.umd.min.js" in html
+    assert "DEMO MODE — SIMULATED CARBON" in html
+    assert "Simulated Timeline & Context" in html
 
 
 def test_telemetry_route(client):
@@ -25,6 +27,9 @@ def test_telemetry_route(client):
     assert "active_model" in data
     assert "power_watts" in data
     assert "energy_saved_pct" in data
+    assert "simulated_hour" in data
+    assert "simulated_hour_text" in data
+    assert data["demo_mode"] is True
 
 
 def test_fallback_frame_route(client):

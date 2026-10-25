@@ -14,6 +14,11 @@ HEAVY_MODEL_PATH = os.path.join(MODELS_DIR, 'heavy_yolo.pt')
 LIGHT_MODEL_PATH = os.path.join(MODELS_DIR, 'light_yolo.pt')
 DECISIONS_LOG_PATH = os.path.join(LOGS_DIR, 'decisions.csv')
 
+# Demo Mode Configuration
+DEMO_MODE = True
+DEMO_CARBON_3AM = 300.0  # Simulated carbon for 3 AM half (> CARBON_HIGH)
+DEMO_CARBON_9AM = 300.0  # Simulated carbon for 9 AM half (> CARBON_HIGH)
+
 # Feature columns used for both ML training and serving
 FEATURES = ['hour', 'day_of_week', 'month']
 
@@ -29,6 +34,7 @@ POWER_SAVED_PCT = ((HEAVY_POWER_W - ECO_POWER_W) / HEAVY_POWER_W) * 100.0
 
 # Detection parameters
 VEHICLE_CLASSES = [2, 3, 5, 7]  # COCO classes: car, motorcycle, bus, truck
+IMG_SIZE = 416  # YOLO input image size for fast CPU inference
 
 # Eco-mode safety probe interval (Probe with heavy model every N frames to avoid undercounting)
 ECO_SAFETY_PROBE_INTERVAL = 15
