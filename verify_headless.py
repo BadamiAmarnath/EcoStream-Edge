@@ -1,11 +1,12 @@
 """
-Headless Verification Script for EcoStream Decoupled Pipeline
-Runs over exactly one full pass of data/sample_video.mp4 (480 frames, 24 FPS, 20.0s).
-Logs per-second telemetry and measures:
-  - Average vehicle count in first half (3 AM) vs second half (9 AM)
-  - Time at which mode switches from light (eco) to heavy (safety override)
-  - Measured latency of both models (at imgsz=416 and imgsz=640 before/after)
-  - Real playback FPS achieved by the decoupled playback engine
+Headless Verification Script for Multi-Scenario EcoStream Architecture
+Evaluates available scenarios headlessly over one full video loop without a browser.
+Measures:
+  - Average object count in first half vs second half
+  - Exact time/frame of light -> heavy mode switch
+  - Measured per-model latency (ms) during live execution
+  - Real decoupled playback FPS
+  - Absence of missing scenario videos (reports without fabricating counts)
 """
 
 import os
@@ -17,26 +18,25 @@ import numpy as np
 from ultralytics import YOLO
 
 from config import (
-    DEFAULT_VIDEO_PATH,
     HEAVY_MODEL_PATH,
     LIGHT_MODEL_PATH,
-    VEHICLE_CLASSES,
     IMG_SIZE,
     CARBON_HIGH,
     CARBON_LOW,
     DENSITY_THRESHOLD,
     DEMO_MODE,
-    DEMO_CARBON_3AM,
-    DEMO_CARBON_9AM,
     ECO_SAFETY_PROBE_INTERVAL,
     LOGS_DIR,
+    SCENARIOS,
+    interpolate_carbon_profile,
 )
 from orchestrator import choose_mode, get_mode_metadata
 
 
-class HeadlessInferenceWorker(threading.Thread):
-    def __init__(self, heavy_model, light_model):
+class HeadlessScenarioInferenceWorker(threading.Thread):
+    def __init__(self, scenario_config, heavy_model, light_model):
         super().__init__(daemon=True)
+        self.scenario = scenario_config
         self.heavy_model = heavy_model
         self.light_model = light_model
         self.running = True
@@ -61,12 +61,13 @@ class HeadlessInferenceWorker(threading.Thread):
         self.heavy_latencies = []
         self.switch_events = []
 
-    def submit_frame(self, frame, carbon, sim_hour, frame_idx, wall_time):
+    def submit_frame(self, frame, progress, carbon, sim_hour, frame_idx, wall_time):
         with self.lock:
             if self.is_busy:
                 return False
             self.pending_frame = frame.copy()
             self.pending_meta = {
+                "progress": progress,
                 "carbon": carbon,
                 "hour": sim_hour,
                 "frame_idx": frame_idx,
@@ -77,6 +78,13 @@ class HeadlessInferenceWorker(threading.Thread):
             return True
 
     def run(self):
+        load_threshold = self.scenario.get("load_threshold", DENSITY_THRESHOLD)
+        target_classes = self.scenario.get("target_classes", [2, 3, 5, 7])
+        object_label = self.scenario.get("object_label", "objects")
+        device_profile = self.scenario.get("device_profile", {})
+        heavy_w = device_profile.get("heavy_power_w", 35.0)
+        eco_w = device_profile.get("eco_power_w", 12.0)
+
         while self.running:
             self.new_frame_event.wait()
             self.new_frame_event.clear()
@@ -90,56 +98,82 @@ class HeadlessInferenceWorker(threading.Thread):
             if frame is None:
                 continue
 
-            current_carbon = meta.get("carbon", DEMO_CARBON_3AM)
+            current_carbon = meta.get("carbon", 300.0)
             sim_hour = meta.get("hour", 3)
             frame_idx = meta.get("frame_idx", 0)
             wall_time = meta.get("wall_time", 0.0)
 
             t0 = time.perf_counter()
 
-            # Periodic heavy model safety validation probe when in eco mode
-            if (
-                self.current_mode == "eco"
-                and (self.probe_counter % ECO_SAFETY_PROBE_INTERVAL == 0)
-                and self.heavy_model
-            ):
-                probe_res = self.heavy_model(
-                    frame, imgsz=IMG_SIZE, classes=VEHICLE_CLASSES, verbose=False, conf=0.25
-                )
-                probe_cnt = len(probe_res[0].boxes)
-                if probe_cnt >= DENSITY_THRESHOLD:
-                    self.latest_count = probe_cnt
-
-            self.probe_counter += 1
-
-            # Determine mode via central orchestrator
-            new_mode = choose_mode(current_carbon, self.latest_count, self.current_mode)
-            if new_mode != self.current_mode:
-                event_info = {
-                    "from_mode": self.current_mode,
-                    "to_mode": new_mode,
-                    "frame_idx": frame_idx,
-                    "time_sec": round(wall_time, 3),
-                    "vehicle_count": self.latest_count,
-                    "carbon": current_carbon,
-                    "sim_hour": sim_hour,
-                }
-                self.switch_events.append(event_info)
-                self.current_mode = new_mode
-
-            mode_meta = get_mode_metadata(self.current_mode, current_carbon, self.latest_count)
             active_model = (
                 self.light_model
                 if self.current_mode == "eco" and self.light_model
                 else self.heavy_model
             )
 
+            # 1. Detection call on current frame
             boxes = []
+            detected_count = 0
             if active_model is not None:
                 results = active_model(
-                    frame, imgsz=IMG_SIZE, classes=VEHICLE_CLASSES, verbose=False, conf=0.25
+                    frame,
+                    imgsz=IMG_SIZE,
+                    classes=target_classes,
+                    verbose=False,
+                    conf=0.25,
                 )
                 boxes = [b.xyxy[0].cpu().numpy().astype(int) for b in results[0].boxes]
+                detected_count = len(boxes)
+
+            # 2. Periodic heavy model safety probe when in eco mode
+            if (
+                self.current_mode == "eco"
+                and (self.probe_counter % ECO_SAFETY_PROBE_INTERVAL == 0)
+                and self.heavy_model
+            ):
+                probe_res = self.heavy_model(
+                    frame,
+                    imgsz=IMG_SIZE,
+                    classes=target_classes,
+                    verbose=False,
+                    conf=0.25,
+                )
+                probe_cnt = len(probe_res[0].boxes)
+                if probe_cnt >= load_threshold and probe_cnt > detected_count:
+                    detected_count = probe_cnt
+
+            self.probe_counter += 1
+
+            # 3. Synchronously choose mode from this detection's count
+            new_mode = choose_mode(
+                current_carbon,
+                detected_count,
+                self.current_mode,
+                load_threshold=load_threshold,
+            )
+
+            if new_mode != self.current_mode:
+                event_info = {
+                    "from_mode": self.current_mode,
+                    "to_mode": new_mode,
+                    "frame_idx": frame_idx,
+                    "time_sec": round(wall_time, 3),
+                    "detected_count": detected_count,
+                    "carbon": round(current_carbon, 2),
+                    "sim_hour": sim_hour,
+                }
+                self.switch_events.append(event_info)
+                self.current_mode = new_mode
+
+            mode_meta = get_mode_metadata(
+                self.current_mode,
+                current_carbon,
+                detected_count,
+                load_threshold=load_threshold,
+                object_label=object_label,
+                heavy_power_w=heavy_w,
+                eco_power_w=eco_w,
+            )
 
             t1 = time.perf_counter()
             elapsed_ms = (t1 - t0) * 1000.0
@@ -151,104 +185,51 @@ class HeadlessInferenceWorker(threading.Thread):
 
             with self.lock:
                 self.latest_boxes = boxes
-                self.latest_count = len(boxes)
+                self.latest_count = detected_count
                 self.latest_model_tag = mode_meta["model_tag"]
                 self.latest_latency_ms = elapsed_ms
                 self.is_busy = False
 
 
-def measure_before_after_benchmarks(sample_frame, heavy_model, light_model):
-    """
-    Directly measure per-model inference latencies at imgsz=640 (before)
-    vs imgsz=416 (after) on the CPU.
-    """
-    print("\n--- Measuring Per-Model Inference Latency (Before vs After imgsz optimization) ---")
-    frame_resized = cv2.resize(sample_frame, (640, 360))
+def verify_scenario_pass(scenario_cfg, heavy_model, light_model):
+    s_id = scenario_cfg["id"]
+    s_name = scenario_cfg["name"]
+    video_path = scenario_cfg.get("video_path")
+    carbon_profile = scenario_cfg.get("carbon_profile", [])
+    load_threshold = scenario_cfg.get("load_threshold", DENSITY_THRESHOLD)
+    object_label = scenario_cfg.get("object_label", "objects")
+    timeline_labels = scenario_cfg.get("timeline_labels", {})
 
-    # Warmup
-    for _ in range(2):
-        _ = heavy_model(frame_resized, imgsz=640, classes=VEHICLE_CLASSES, verbose=False)
-        _ = light_model(frame_resized, imgsz=416, classes=VEHICLE_CLASSES, verbose=False)
+    print("\n" + "=" * 75)
+    print(f"VERIFYING SCENARIO: {s_name} ({s_id})")
+    print("=" * 75)
 
-    # 1. Heavy Model at imgsz=640 (Before)
-    t_heavy_640 = []
-    for _ in range(5):
-        t0 = time.perf_counter()
-        _ = heavy_model(frame_resized, imgsz=640, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
-        t_heavy_640.append((time.perf_counter() - t0) * 1000.0)
-    avg_heavy_640 = float(np.mean(t_heavy_640))
+    if not video_path or not os.path.exists(video_path):
+        print(f"[STATUS] Scenario video NOT found at: {video_path}")
+        print("         Skipping headless video pass. No simulated counts will be fabricated.")
+        return {
+            "scenario_id": s_id,
+            "status": "VIDEO_MISSING",
+            "video_path": video_path,
+        }
 
-    # 2. Heavy Model at imgsz=416 (After)
-    t_heavy_416 = []
-    for _ in range(5):
-        t0 = time.perf_counter()
-        _ = heavy_model(frame_resized, imgsz=416, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
-        t_heavy_416.append((time.perf_counter() - t0) * 1000.0)
-    avg_heavy_416 = float(np.mean(t_heavy_416))
-
-    # 3. Light Model at imgsz=640 (Before)
-    t_light_640 = []
-    for _ in range(10):
-        t0 = time.perf_counter()
-        _ = light_model(frame_resized, imgsz=640, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
-        t_light_640.append((time.perf_counter() - t0) * 1000.0)
-    avg_light_640 = float(np.mean(t_light_640))
-
-    # 4. Light Model at imgsz=416 (After)
-    t_light_416 = []
-    for _ in range(10):
-        t0 = time.perf_counter()
-        _ = light_model(frame_resized, imgsz=416, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
-        t_light_416.append((time.perf_counter() - t0) * 1000.0)
-    avg_light_416 = float(np.mean(t_light_416))
-
-    print(f"Heavy Model (YOLOv8m) @ 640px (BEFORE) : {avg_heavy_640:.2f} ms")
-    print(f"Heavy Model (YOLOv8m) @ 416px (AFTER)  : {avg_heavy_416:.2f} ms ({((avg_heavy_640 - avg_heavy_416)/avg_heavy_640)*100:.1f}% faster)")
-    print(f"Light Model (YOLOv8n) @ 640px (BEFORE) : {avg_light_640:.2f} ms")
-    print(f"Light Model (YOLOv8n) @ 416px (AFTER)  : {avg_light_416:.2f} ms ({((avg_light_640 - avg_light_416)/avg_light_640)*100:.1f}% faster)")
-
-    return {
-        "heavy_640_ms": round(avg_heavy_640, 2),
-        "heavy_416_ms": round(avg_heavy_416, 2),
-        "light_640_ms": round(avg_light_640, 2),
-        "light_416_ms": round(avg_light_416, 2),
-    }
-
-
-def run_headless_verification():
-    print("=" * 70)
-    print("      ECOSTREAM HEADLESS FULL-PASS VERIFICATION (Task e)")
-    print("=" * 70)
-
-    if not os.path.exists(DEFAULT_VIDEO_PATH):
-        raise FileNotFoundError(f"Video file not found at {DEFAULT_VIDEO_PATH}")
-
-    cap = cv2.VideoCapture(DEFAULT_VIDEO_PATH)
+    cap = cv2.VideoCapture(video_path)
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 480)
     video_duration = total_frames / video_fps
-    print(f"Video Source      : {DEFAULT_VIDEO_PATH}")
+
+    print(f"Video File        : {video_path}")
     print(f"Native Video FPS  : {video_fps:.2f}")
     print(f"Total Frame Count : {total_frames} frames ({video_duration:.2f} seconds)")
-    print(f"Configuration     : DEMO_MODE={DEMO_MODE}, IMG_SIZE={IMG_SIZE}")
+    print(f"Load Threshold    : {load_threshold} {object_label}")
+    print(f"Carbon Profile    : {carbon_profile}")
 
-    print("[INFO] Loading YOLO models...")
-    heavy_model = YOLO(HEAVY_MODEL_PATH)
-    light_model = YOLO(LIGHT_MODEL_PATH)
-
-    ret, sample_frame = cap.read()
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-    # Benchmark before/after imgsz
-    benchmarks = measure_before_after_benchmarks(sample_frame, heavy_model, light_model)
-
-    # Start Async Inference Worker
-    worker = HeadlessInferenceWorker(heavy_model, light_model)
+    worker = HeadlessScenarioInferenceWorker(scenario_cfg, heavy_model, light_model)
     worker.start()
 
     print("\n--- Starting Real-Time Decoupled Playback (1 Full Pass) ---")
-    print(f"{'Sec':>3} | {'Hour':>5} | {'Carbon':>6} | {'Vehicles':>8} | {'Active Mode':>16} | {'Active Model':>18} | {'Latency (ms)':>12}")
-    print("-" * 85)
+    print(f"{'Sec':>3} | {'Period/Hour':>20} | {'Carbon':>7} | {object_label.capitalize():>10} | {'Active Mode':>16} | {'Active Model':>18} | {'Latency':>10}")
+    print("-" * 96)
 
     frame_duration = 1.0 / video_fps
     frame_counter = 0
@@ -285,18 +266,15 @@ def run_headless_verification():
         pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
         progress = pos / total_frames if total_frames > 0 else 0.0
 
-        if DEMO_MODE:
-            sim_hour = 3 if progress < 0.5 else 9
-            carbon = DEMO_CARBON_3AM if progress < 0.5 else DEMO_CARBON_9AM
-        else:
-            sim_hour = (frame_counter // 20) % 24
-            carbon = 250.0
+        current_carbon = interpolate_carbon_profile(carbon_profile, progress)
+        sim_hour = 3 if progress < 0.5 else 9
+        period_text = timeline_labels.get("first", "Period 1") if progress < 0.5 else timeline_labels.get("second", "Period 2")
 
         frame_resized = cv2.resize(frame, (640, 360))
         wall_time = time.perf_counter() - start_wall_clock
 
         # Submit to async inference worker
-        worker.submit_frame(frame_resized, carbon, sim_hour, frame_counter, wall_time)
+        worker.submit_frame(frame_resized, progress, current_carbon, sim_hour, frame_counter, wall_time)
 
         # Retrieve latest boxes and count
         with worker.lock:
@@ -316,17 +294,17 @@ def run_headless_verification():
             log_entry = {
                 "second": sec_num,
                 "progress": round(progress, 3),
-                "sim_hour": sim_hour,
-                "carbon": carbon,
-                "vehicle_count": current_count,
+                "period": period_text,
+                "carbon": round(current_carbon, 1),
+                "detected_count": current_count,
                 "mode": current_mode,
                 "model_tag": current_model_tag,
                 "latency_ms": round(current_latency, 2),
             }
             per_second_logs.append(log_entry)
             print(
-                f"{sec_num:>3}s | {sim_hour:02d}:00 | {carbon:>6.1f} | {current_count:>8d} | "
-                f"{current_mode:>16} | {current_model_tag:>18} | {current_latency:>12.1f}"
+                f"{sec_num:>3}s | {period_text:>20} | {current_carbon:>6.1f}g | {current_count:>10d} | "
+                f"{current_mode:>16} | {current_model_tag:>18} | {current_latency:>8.1f}ms"
             )
             next_log_time += 1.0
 
@@ -342,61 +320,82 @@ def run_headless_verification():
     worker.new_frame_event.set()
 
     measured_playback_fps = (displayed_frames + skipped_frames) / total_elapsed
-    avg_first_half_vehicles = float(np.mean(first_half_counts)) if first_half_counts else 0.0
-    avg_second_half_vehicles = float(np.mean(second_half_counts)) if second_half_counts else 0.0
-    avg_run_light_latency = float(np.mean(worker.light_latencies)) if worker.light_latencies else 0.0
-    avg_run_heavy_latency = float(np.mean(worker.heavy_latencies)) if worker.heavy_latencies else 0.0
+    avg_first_half = float(np.mean(first_half_counts)) if first_half_counts else 0.0
+    avg_second_half = float(np.mean(second_half_counts)) if second_half_counts else 0.0
+    avg_light_latency = float(np.mean(worker.light_latencies)) if worker.light_latencies else 0.0
+    avg_heavy_latency = float(np.mean(worker.heavy_latencies)) if worker.heavy_latencies else 0.0
 
-    print("-" * 85)
-    print("\n" + "=" * 70)
-    print("               FINAL VERIFICATION MEASUREMENTS REPORT")
-    print("=" * 70)
+    print("-" * 96)
+    print(f"\n[RESULTS FOR {s_name.upper()}]")
     print(f"1. Playback FPS               : {measured_playback_fps:.2f} FPS (Target: {video_fps:.1f} FPS)")
-    print(f"   Total Playback Elapsed Time: {total_elapsed:.2f} s (for 20.0s video)")
-    print(f"   Frames Displayed           : {displayed_frames} (Skipped for real-time catchup: {skipped_frames})")
-    print(f"2. Vehicle Count First Half   : {avg_first_half_vehicles:.2f} avg vehicles (3 AM, low traffic)")
-    print(f"   Vehicle Count Second Half  : {avg_second_half_vehicles:.2f} avg vehicles (9 AM, rush hour)")
+    print(f"   Total Playback Elapsed Time: {total_elapsed:.2f} s (for {video_duration:.2f}s video)")
+    print(f"   Frames Displayed           : {displayed_frames} (Skipped: {skipped_frames})")
+    print(f"2. Average Scene Load:")
+    print(f"   - First Half               : {avg_first_half:.2f} {object_label} ({timeline_labels.get('first')})")
+    print(f"   - Second Half              : {avg_second_half:.2f} {object_label} ({timeline_labels.get('second')})")
     print(f"3. Mode Switch Transitions    : {len(worker.switch_events)} event(s)")
     for idx, sw in enumerate(worker.switch_events, 1):
         print(f"   Event {idx}: Switched from '{sw['from_mode']}' -> '{sw['to_mode']}'")
         print(f"            At Time       : {sw['time_sec']:.2f}s (Frame {sw['frame_idx']})")
-        print(f"            Simulated Hour: {sw['sim_hour']:02d}:00")
-        print(f"            Grid Carbon   : {sw['carbon']:.1f} gCO2/kWh")
-        print(f"            Vehicle Count : {sw['vehicle_count']} vehicles (Threshold = {DENSITY_THRESHOLD})")
+        print(f"            Carbon (Sim)  : {sw['carbon']:.1f} gCO2/kWh")
+        print(f"            Scene Load    : {sw['detected_count']} {object_label} (Threshold = {load_threshold})")
+
+    # Check whether light model exceeded threshold in second half
+    if avg_second_half >= load_threshold:
+        print(f"   Safety Override Status: Triggered cleanly (average {avg_second_half:.2f} >= threshold {load_threshold})")
+    else:
+        print(f"   [WARNING] Second half scene load {avg_second_half:.2f} remained below {load_threshold}.")
 
     print(f"4. Measured Inference Latency during run (imgsz={IMG_SIZE}):")
-    print(f"   - Light Model (YOLOv8n)    : {avg_run_light_latency:.2f} ms/call ({len(worker.light_latencies)} calls)")
-    print(f"   - Heavy Model (YOLOv8m)    : {avg_run_heavy_latency:.2f} ms/call ({len(worker.heavy_latencies)} calls)")
-    print(f"5. Before vs After Latency Comparison (Single-Call Benchmarks):")
-    print(f"   - Heavy Model Before (640px): {benchmarks['heavy_640_ms']} ms")
-    print(f"   - Heavy Model After  (416px): {benchmarks['heavy_416_ms']} ms ({((benchmarks['heavy_640_ms'] - benchmarks['heavy_416_ms'])/benchmarks['heavy_640_ms'])*100:.1f}% reduction)")
-    print(f"   - Light Model Before (640px): {benchmarks['light_640_ms']} ms")
-    print(f"   - Light Model After  (416px): {benchmarks['light_416_ms']} ms ({((benchmarks['light_640_ms'] - benchmarks['light_416_ms'])/benchmarks['light_640_ms'])*100:.1f}% reduction)")
-    print("=" * 70)
+    print(f"   - Light Model (YOLOv8n)    : {avg_light_latency:.2f} ms/call ({len(worker.light_latencies)} calls)")
+    print(f"   - Heavy Model (YOLOv8m)    : {avg_heavy_latency:.2f} ms/call ({len(worker.heavy_latencies)} calls)")
 
-    # Save results to JSON
-    report_data = {
-        "timestamp": time.time(),
+    return {
+        "scenario_id": s_id,
+        "scenario_name": s_name,
+        "status": "COMPLETED",
         "video_fps": video_fps,
         "measured_playback_fps": round(measured_playback_fps, 2),
         "total_elapsed_sec": round(total_elapsed, 2),
         "displayed_frames": displayed_frames,
         "skipped_frames": skipped_frames,
-        "avg_first_half_vehicles": round(avg_first_half_vehicles, 2),
-        "avg_second_half_vehicles": round(avg_second_half_vehicles, 2),
+        "avg_first_half_load": round(avg_first_half, 2),
+        "avg_second_half_load": round(avg_second_half, 2),
         "switch_events": worker.switch_events,
-        "measured_light_latency_ms": round(avg_run_light_latency, 2),
-        "measured_heavy_latency_ms": round(avg_run_heavy_latency, 2),
-        "benchmarks_before_after": benchmarks,
+        "measured_light_latency_ms": round(avg_light_latency, 2),
+        "measured_heavy_latency_ms": round(avg_heavy_latency, 2),
         "per_second_logs": per_second_logs,
     }
+
+
+def run_all_verifications():
+    print("=" * 75)
+    print("   ECOSTREAM MULTI-SCENARIO HEADLESS VERIFICATION")
+    print("=" * 75)
+
+    print("[INFO] Loading shared YOLO models into memory...")
+    heavy_model = YOLO(HEAVY_MODEL_PATH)
+    light_model = YOLO(LIGHT_MODEL_PATH)
+
+    # Warm up models on dummy frames to avoid PyTorch cold-start latency
+    dummy = np.zeros((360, 640, 3), dtype=np.uint8)
+    _ = heavy_model(dummy, imgsz=IMG_SIZE, verbose=False)
+    _ = light_model(dummy, imgsz=IMG_SIZE, verbose=False)
+
+    results = {}
+    for s_id, s_cfg in SCENARIOS.items():
+        res = verify_scenario_pass(s_cfg, heavy_model, light_model)
+        results[s_id] = res
 
     out_file = os.path.join(LOGS_DIR, "headless_verification.json")
     os.makedirs(LOGS_DIR, exist_ok=True)
     with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(report_data, f, indent=2)
-    print(f"[SUCCESS] Verification report saved to {out_file}\n")
+        json.dump(results, f, indent=2)
+
+    print("\n" + "=" * 75)
+    print(f"[SUCCESS] Multi-scenario verification results saved to: {out_file}")
+    print("=" * 75 + "\n")
 
 
 if __name__ == "__main__":
-    run_headless_verification()
+    run_all_verifications()
