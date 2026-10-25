@@ -76,7 +76,11 @@ SCENARIOS = {
         "id": "retail_store",
         "name": "Retail Store Footfall",
         "description": "Edge occupancy monitoring with real-time crowd density scaling",
-        "video_path": os.path.join(DATA_DIR, "scenario2_retail.mp4"),
+        "video_path": (
+            os.path.join(DATA_DIR, "scenario2_retail.mp4")
+            if os.path.exists(os.path.join(DATA_DIR, "scenario2_retail.mp4"))
+            else os.path.join(DATA_DIR, "Untitled design.mp4")
+        ),
         "target_classes": [0],  # COCO: person
         "class_names": ["person"],
         "object_label": "people",
