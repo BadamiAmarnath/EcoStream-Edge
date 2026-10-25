@@ -2,61 +2,114 @@ import os
 import cv2
 import glob
 import pickle
-import numpy as np
 import time
+import threading
+import logging
+import numpy as np
+import pandas as pd
 from datetime import datetime
 from flask import Flask, render_template_string, Response, jsonify
+
 from ultralytics import YOLO
+from config import (
+    MODELS_DIR,
+    DATA_DIR,
+    PREDICTOR_PATH,
+    HEAVY_MODEL_PATH,
+    LIGHT_MODEL_PATH,
+    DEFAULT_VIDEO_PATH,
+    GRID_DATA_PATH,
+    CARBON_HIGH,
+    CARBON_LOW,
+    DENSITY_THRESHOLD,
+    HEAVY_POWER_W,
+    ECO_POWER_W,
+    POWER_SAVED_PCT,
+    VEHICLE_CLASSES,
+    ECO_SAFETY_PROBE_INTERVAL,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+)
+from orchestrator import predict_carbon, choose_mode, get_mode_metadata, log_decision
 
 app = Flask(__name__)
 
-# Base directories
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODELS_DIR = os.path.join(BASE_DIR, 'models')
-DATA_DIR = os.path.join(BASE_DIR, 'data')
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("ecostream.app")
+
+# Precompute historical hourly mean fallback values from CSV
+try:
+    if os.path.exists(GRID_DATA_PATH):
+        df_csv = pd.read_csv(GRID_DATA_PATH)
+        HOURLY_FALLBACK = df_csv.groupby("hour")["carbon_intensity"].mean().to_dict()
+    else:
+        HOURLY_FALLBACK = {h: 250.0 for h in range(24)}
+except Exception as e:
+    logger.warning("Could not precompute hourly carbon fallback: %s", e)
+    HOURLY_FALLBACK = {h: 250.0 for h in range(24)}
 
 # Load Predictor and YOLO Models into memory
-with open(os.path.join(MODELS_DIR, 'grid_predictor.pkl'), 'rb') as f:
-    grid_predictor = pickle.load(f)
+grid_predictor = None
+if os.path.exists(PREDICTOR_PATH):
+    try:
+        with open(PREDICTOR_PATH, "rb") as f:
+            grid_predictor = pickle.load(f)
+        logger.info("Grid carbon predictor loaded successfully from %s", PREDICTOR_PATH)
+    except Exception as e:
+        logger.error("Failed to load grid predictor: %s", e)
+else:
+    logger.warning("Predictor not found at %s. Please run train_predictor.py", PREDICTOR_PATH)
 
-print("[INFO] Pre-warming YOLO models into system memory...")
-model_heavy = YOLO(os.path.join(MODELS_DIR, 'heavy_yolo.pt'))
-model_light = YOLO(os.path.join(MODELS_DIR, 'light_yolo.pt'))
-print(f"[INFO] Heavy Model loaded at address: {hex(id(model_heavy))}")
-print(f"[INFO] Eco Model loaded at address  : {hex(id(model_light))}")
+logger.info("Pre-warming YOLO models into system memory...")
+model_heavy = None
+model_light = None
 
-# Robust Video Auto-Discovery
+if os.path.exists(HEAVY_MODEL_PATH):
+    model_heavy = YOLO(HEAVY_MODEL_PATH)
+    logger.info("Heavy Model loaded at memory address: %s", hex(id(model_heavy)))
+else:
+    logger.warning("Heavy model not found at %s. Please run download_models.py", HEAVY_MODEL_PATH)
+
+if os.path.exists(LIGHT_MODEL_PATH):
+    model_light = YOLO(LIGHT_MODEL_PATH)
+    logger.info("Eco Model loaded at memory address  : %s", hex(id(model_light)))
+else:
+    logger.warning("Light model not found at %s. Please run download_models.py", LIGHT_MODEL_PATH)
+
+
 def get_video_source():
-    # 1. Try default sample_video.mp4
-    default_path = os.path.join(DATA_DIR, 'sample_video.mp4')
-    if os.path.exists(default_path):
-        return default_path
-    
-    # 2. Look for any .mp4 file inside the data folder
-    mp4_files = glob.glob(os.path.join(DATA_DIR, '*.mp4'))
+    """Discover available video stream source or fallback."""
+    if os.path.exists(DEFAULT_VIDEO_PATH):
+        return DEFAULT_VIDEO_PATH
+
+    mp4_files = glob.glob(os.path.join(DATA_DIR, "*.mp4"))
     if mp4_files:
         return mp4_files[0]
-        
-    return default_path
+
+    return None
+
 
 VIDEO_PATH = get_video_source()
-print(f"[INFO] Streaming target video file: {VIDEO_PATH}")
+logger.info("Streaming target video source: %s", VIDEO_PATH if VIDEO_PATH else "NONE (Offline / Fallback)")
 
+# Shared Telemetry State with Mutex
+telemetry_lock = threading.Lock()
 current_telemetry = {
-    "carbon_intensity": 725.0,
+    "carbon_intensity": float(CARBON_HIGH),
     "vehicle_count": 0,
     "active_model": "YOLOv8m",
     "active_model_params": "25.9M",
-    "model_memory_address": hex(id(model_heavy)),
+    "model_memory_address": hex(id(model_heavy)) if model_heavy else "0x000000000000",
     "state": "Default Mode",
     "latency_ms": 0.0,
-    "power_watts": 35.0,
+    "power_watts": HEAVY_POWER_W,
     "cum_baseline_energy": 0.0,
     "cum_ecostream_energy": 0.0,
     "energy_saved_pct": 0.0,
     "cum_carbon_saved_g": 0.0,
     "xai_explanation": "Initializing neural orchestration runtime...",
-    "switch_logs": []
+    "switch_logs": [],
 }
 
 HTML_TEMPLATE = """
@@ -65,7 +118,8 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <title>EcoStream AI | Live Runtime Orchestrator</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Pinned Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -141,7 +195,7 @@ HTML_TEMPLATE = """
             <div>
                 <div style="font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; margin-bottom:6px;">Runtime Transition Log</div>
                 <div class="log-box" id="log-feed">
-                    <div class="log-item">System ready. Video capture initialized.</div>
+                    <div class="log-item">System ready. Pipeline initialized.</div>
                 </div>
             </div>
         </div>
@@ -158,7 +212,7 @@ HTML_TEMPLATE = """
                     <div class="model-specs">
                         Weight: heavy_yolo.pt<br>
                         Params: 25.9M (YOLOv8m)<br>
-                        Nominal Power: 35.0W
+                        Nominal Power: {{ heavy_power_w }}W
                     </div>
                 </div>
                 <div class="model-card" id="card-eco">
@@ -169,7 +223,7 @@ HTML_TEMPLATE = """
                     <div class="model-specs">
                         Weight: light_yolo.pt<br>
                         Params: 3.2M (YOLOv8n)<br>
-                        Throttled Power: 12.0W
+                        Throttled Power: {{ eco_power_w }}W ({{ power_saved_pct|round|int }}% Saved)
                     </div>
                 </div>
             </div>
@@ -194,7 +248,7 @@ HTML_TEMPLATE = """
 
             <div class="progress-box">
                 <div style="display:flex; justify-content:space-between;">
-                    <span class="metric-label">Cumulative Energy Saved</span>
+                    <span class="metric-label">Estimated Energy Saved</span>
                     <span id="energy-pct" style="font-family:'JetBrains Mono'; font-weight:700; color:#10b981;">0.0%</span>
                 </div>
                 <div class="progress-bg"><div class="progress-fill" id="energy-bar"></div></div>
@@ -202,7 +256,7 @@ HTML_TEMPLATE = """
 
             <div class="metric-grid">
                 <div class="metric-pill">
-                    <div class="metric-label">Carbon Abated</div>
+                    <div class="metric-label">Estimated Carbon Abated</div>
                     <div class="metric-val" id="carbon-saved" style="color:#10b981;">0.000 g</div>
                 </div>
                 <div class="metric-pill">
@@ -225,15 +279,35 @@ HTML_TEMPLATE = """
             data: {
                 labels: Array(15).fill(''),
                 datasets: [
-                    { label: 'Grid Carbon', data: Array(15).fill(720), borderColor: '#38bdf8', borderWidth: 2, fill: false, tension: 0.3, pointRadius: 1 },
-                    { label: 'Limit (720)', data: Array(15).fill(720), borderColor: '#ef4444', borderDash: [4, 4], pointRadius: 0, fill: false }
+                    { 
+                        label: 'Grid Carbon', 
+                        data: Array(15).fill({{ carbon_high }}), 
+                        borderColor: '#38bdf8', 
+                        borderWidth: 2, 
+                        fill: false, 
+                        tension: 0.3, 
+                        pointRadius: 1 
+                    },
+                    { 
+                        label: 'Limit ({{ carbon_high|round|int }})', 
+                        data: Array(15).fill({{ carbon_high }}), 
+                        borderColor: '#ef4444', 
+                        borderDash: [4, 4], 
+                        pointRadius: 0, 
+                        fill: false 
+                    }
                 ]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
                 scales: {
-                    y: { min: 670, max: 750, ticks: { color: '#64748b', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                    y: { 
+                        min: {{ y_min }}, 
+                        max: {{ y_max }}, 
+                        ticks: { color: '#64748b', font: { size: 9 } }, 
+                        grid: { color: 'rgba(255,255,255,0.05)' } 
+                    },
                     x: { display: false }
                 },
                 plugins: { legend: { display: false } }
@@ -294,161 +368,321 @@ HTML_TEMPLATE = """
                     carbonChart.data.datasets[0].data.push(d.carbon_intensity);
                     carbonChart.data.datasets[0].data.shift();
                     carbonChart.update('none');
-                });
+                })
+                .catch(err => console.debug("Telemetry fetch pending...", err));
         }, 300);
     </script>
 </body>
 </html>
 """
 
-def generate_frames():
-    global current_telemetry
-    cap = cv2.VideoCapture(VIDEO_PATH)
 
-    C_THRESH = 720.0
-    D_THRESH = 5
-    BASELINE_POWER_W = 35.0
-    
-    frame_idx = 0
-    cached_boxes = []
-    cached_count = 0
-    cached_model_tag = "YOLOv8m"
-    cached_state = "Default Mode"
-    cached_color = (0, 165, 255)
-    last_printed_model = None
+class VideoStreamWorker(threading.Thread):
+    """
+    Decoupled single background worker:
+    Captures frames, executes carbon prediction & YOLO inference,
+    updates shared telemetry, and produces a single latest JPEG buffer.
+    All web clients read from this buffer with ZERO multi-viewer duplicate inference lag.
+    """
 
-    while True:
-        ret, frame = cap.read()
-        
-        # Robust Frame Recovery: loop video seamlessly if it reaches the end or drops a frame
-        if not ret or frame is None:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                time.sleep(0.04)
-                continue
+    def __init__(self, video_source):
+        super().__init__(daemon=True)
+        self.video_source = video_source
+        self.latest_jpeg_bytes = None
+        self.lock = threading.Lock()
+        self.running = True
 
-        frame_idx += 1
-        frame = cv2.resize(frame, (640, 360))
+    def build_synthetic_frame(self, frame_idx, text="STREAM STANDBY"):
+        """Generate animated synthetic video frame when no video file is present."""
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        # Background gradient
+        frame[:] = (20, 24, 34)
 
-        simulated_hour = (frame_idx // 20) % 24
-        diurnal_curve = [718, 722, 725, 728, 727, 723, 719, 712, 704, 695, 688, 682, 
-                         679, 683, 690, 701, 714, 724, 731, 735, 736, 732, 726, 721]
-        try:
-            pred_carbon = float(grid_predictor.predict([[simulated_hour, 1, 150000.0, 20.0]])[0])
-        except Exception:
-            pred_carbon = float(diurnal_curve[simulated_hour])
+        # Draw road lanes
+        cv2.rectangle(frame, (0, 100), (640, 280), (35, 40, 52), -1)
+        for x in range((frame_idx * 6) % 80 - 80, 640, 80):
+            cv2.line(frame, (x, 190), (x + 40, 190), (120, 130, 150), 2)
 
-        # Execute decision logic every 3rd frame
-        if frame_idx % 3 == 0:
-            start_time = cv2.getTickCount()
+        # Draw simulated moving vehicles (cars)
+        num_sim_cars = 3 if (frame_idx // 60) % 2 == 0 else 6
+        for i in range(num_sim_cars):
+            x = (frame_idx * (3 + i * 2) + i * 140) % 640
+            y = 130 if i % 2 == 0 else 220
+            color = (56, 189, 248) if i % 2 == 0 else (16, 185, 129)
+            cv2.rectangle(frame, (x, y), (x + 55, y + 28), color, -1)
+            cv2.rectangle(frame, (x, y), (x + 55, y + 28), (255, 255, 255), 1)
 
-            # --- PRIORITIZED HEURISTIC ORCHESTRATION ---
-            if cached_count >= D_THRESH:
-                active_model = model_heavy
-                cached_model_tag = "YOLOv8m (Heavy Core)"
-                cached_state = "Safety-Critical Override"
-                est_power = 35.0
-                cached_color = (60, 60, 245)  # Bright Coral Red
-                explanation = f"[SAFETY OVERRIDE] Traffic density is {cached_count} (>= {D_THRESH}). Safety override forces YOLOv8m to ensure zero tracking dropouts."
-            elif pred_carbon > C_THRESH:
-                active_model = model_light
-                cached_model_tag = "YOLOv8n (Eco Core)"
-                cached_state = "Eco-Mode Abatement"
-                est_power = 12.0
-                cached_color = (50, 220, 100)  # Bright Neon Green
-                explanation = f"[ECO-MODE ACTIVE] Grid carbon is {pred_carbon:.1f} gCO2/kWh (> {C_THRESH}). Traffic is sparse ({cached_count} < {D_THRESH}). Throttled to YOLOv8n to save 65% power."
+        cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_DUPLEX, 0.6, (56, 189, 248), 1, cv2.LINE_AA)
+        return frame
+
+    def run(self):
+        global current_telemetry
+
+        cap = None
+        if self.video_source and os.path.exists(self.video_source):
+            cap = cv2.VideoCapture(self.video_source)
+
+        frame_idx = 0
+        cached_boxes = []
+        cached_count = 0
+        cached_model_tag = "YOLOv8m (Heavy Core)"
+        cached_state = "Default Mode"
+        cached_color = (255, 165, 0)
+        current_mode = "heavy_default"
+        current_sim_hour = -1
+        current_carbon = float(CARBON_HIGH)
+
+        while self.running:
+            # 1. Acquire Frame
+            if cap and cap.isOpened():
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        time.sleep(0.03)
+                        continue
             else:
-                active_model = model_heavy
-                cached_model_tag = "YOLOv8m (Heavy Core)"
-                cached_state = "Default Mode"
-                est_power = 35.0
-                cached_color = (255, 165, 0)
-                explanation = f"[DEFAULT MODE] Grid carbon is {pred_carbon:.1f} gCO2/kWh (<= {C_THRESH}). Clean energy available; executing high-fidelity core."
+                # Synthetic simulated camera feed
+                frame = self.build_synthetic_frame(frame_idx, "ECOSTREAM SYNTHETIC SIMULATION STREAM")
 
-            # Terminal verbose logging of backend object swap
-            if active_model != last_printed_model:
-                now_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                print("\n" + "="*80)
-                print(f"[ECOSTREAM BACKEND HOT-SWAP @ {now_str}]")
-                print(f" > Transition Trigger  : {cached_state}")
-                print(f" > Active Model Object : {cached_model_tag}")
-                print(f" > Memory Address (ID) : {hex(id(active_model))}")
-                print(f" > Internal Backbone   : {active_model.model.__class__.__name__}")
-                print(f" > Rationale           : {explanation}")
-                print("="*80 + "\n")
-                last_printed_model = active_model
+            frame_idx += 1
+            frame = cv2.resize(frame, (640, 360))
 
-            # Neural forward pass
-            results = active_model(frame, classes=[2, 3, 5, 7], verbose=False, conf=0.25)
-            boxes = results[0].boxes
+            # 2. Simulated Clock: hour advances every 20 frames (simulates 24-hour day in ~16s)
+            simulated_hour = (frame_idx // 20) % 24
 
-            cached_boxes = []
-            cached_count = len(boxes)
-            for box in boxes:
-                xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                cached_boxes.append(xyxy)
+            # Predict carbon intensity ONCE per simulated hour
+            if simulated_hour != current_sim_hour:
+                current_sim_hour = simulated_hour
+                current_carbon = predict_carbon(
+                    grid_predictor,
+                    hour=simulated_hour,
+                    fallback=HOURLY_FALLBACK.get(simulated_hour, 250.0),
+                )
 
-            elapsed_ms = (cv2.getTickCount() - start_time) / cv2.getTickFrequency() * 1000.0
+            # 3. Decision & Inference every 3rd frame
+            if frame_idx % 3 == 0 or frame_idx == 1:
+                start_ticks = cv2.getTickCount()
 
-            # Energy calculations
-            frame_duration_sec = 0.1
-            baseline_energy_joules = BASELINE_POWER_W * frame_duration_sec
-            ecostream_energy_joules = est_power * frame_duration_sec
+                # Eco-Mode Safety Gap Verification:
+                # Periodic heavy model probe every N frames while in eco mode to eliminate nano undercounting
+                if current_mode == "eco" and (frame_idx % ECO_SAFETY_PROBE_INTERVAL == 0) and model_heavy:
+                    probe_res = model_heavy(frame, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
+                    probe_cnt = len(probe_res[0].boxes)
+                    if probe_cnt >= DENSITY_THRESHOLD:
+                        # Safety override immediately triggered by heavy validation probe
+                        cached_count = probe_cnt
 
-            current_telemetry["cum_baseline_energy"] += baseline_energy_joules
-            current_telemetry["cum_ecostream_energy"] += ecostream_energy_joules
+                # Determine target operating mode via central orchestrator
+                new_mode = choose_mode(current_carbon, cached_count, current_mode)
 
-            joules_saved = current_telemetry["cum_baseline_energy"] - current_telemetry["cum_ecostream_energy"]
-            energy_saved_pct = (joules_saved / current_telemetry["cum_baseline_energy"]) * 100.0 if current_telemetry["cum_baseline_energy"] > 0 else 0.0
-            carbon_saved_grams = (joules_saved / 3600000.0) * pred_carbon
+                # Log transition on mode change
+                if new_mode != current_mode:
+                    meta = get_mode_metadata(new_mode, current_carbon, cached_count)
+                    log_decision(
+                        simulated_hour=simulated_hour,
+                        carbon=current_carbon,
+                        vehicle_count=cached_count,
+                        mode=new_mode,
+                        reason=meta["state_label"],
+                    )
+                    logger.info(
+                        "[ORCHESTRATOR TRANSITION] Mode: %s | Carbon: %.1f | Vehicles: %d | %s",
+                        new_mode,
+                        current_carbon,
+                        cached_count,
+                        meta["state_label"],
+                    )
+                    current_mode = new_mode
 
-            # Update shared state
-            current_telemetry["carbon_intensity"] = pred_carbon
-            current_telemetry["vehicle_count"] = cached_count
-            current_telemetry["active_model"] = cached_model_tag
-            current_telemetry["model_memory_address"] = hex(id(active_model))
-            current_telemetry["state"] = cached_state
-            current_telemetry["latency_ms"] = elapsed_ms
-            current_telemetry["power_watts"] = est_power
-            current_telemetry["energy_saved_pct"] = energy_saved_pct
-            current_telemetry["cum_carbon_saved_g"] = carbon_saved_grams
-            current_telemetry["xai_explanation"] = explanation
+                meta = get_mode_metadata(current_mode, current_carbon, cached_count)
+                cached_model_tag = meta["model_tag"]
+                cached_state = meta["state_label"]
+                cached_color = meta["color_bgr"]
+                est_power = meta["power_w"]
+                explanation = meta["explanation"]
 
-        # In-Video Bounding Boxes and HUD Overlays
-        cv2.rectangle(frame, (2, 2), (637, 357), cached_color, 2)
-        for xyxy in cached_boxes:
-            cv2.rectangle(frame, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), cached_color, 2)
+                # Select active YOLO model
+                active_model = model_light if current_mode == "eco" and model_light else model_heavy
 
-        # In-video HUD info box
-        active_ptr = hex(id(model_heavy if "Heavy" in cached_model_tag else model_light))[-6:]
-        cv2.rectangle(frame, (10, 10), (330, 60), (15, 20, 30), -1)
-        cv2.rectangle(frame, (10, 10), (330, 60), cached_color, 1)
-        cv2.putText(frame, f"CORE: {cached_model_tag.split()[0]} [0x{active_ptr}]", 
-                    (20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.52, cached_color, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"STATE: {cached_state}", 
-                    (20, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 220, 240), 1, cv2.LINE_AA)
+                if active_model is not None:
+                    results = active_model(frame, classes=VEHICLE_CLASSES, verbose=False, conf=0.25)
+                    boxes = results[0].boxes
+                    cached_boxes = []
+                    cached_count = len(boxes)
+                    for box in boxes:
+                        xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                        cached_boxes.append(xyxy)
+                else:
+                    cached_boxes = []
 
-        ret_enc, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ret_enc:
-            continue
-            
-        frame_bytes = buffer.tobytes()
+                elapsed_ticks = cv2.getTickCount() - start_ticks
+                elapsed_ms = (elapsed_ticks / cv2.getTickFrequency()) * 1000.0
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                # Measured energy calculations using measured execution latency
+                elapsed_sec = elapsed_ms / 1000.0
+                baseline_energy_joules = HEAVY_POWER_W * elapsed_sec
+                ecostream_energy_joules = est_power * elapsed_sec
 
-@app.route('/')
+                with telemetry_lock:
+                    current_telemetry["cum_baseline_energy"] += baseline_energy_joules
+                    current_telemetry["cum_ecostream_energy"] += ecostream_energy_joules
+
+                    delta_joules = baseline_energy_joules - ecostream_energy_joules
+                    if delta_joules > 0:
+                        delta_carbon_grams = (delta_joules / 3600000.0) * current_carbon
+                        current_telemetry["cum_carbon_saved_g"] += delta_carbon_grams
+
+                    joules_saved = (
+                        current_telemetry["cum_baseline_energy"] - current_telemetry["cum_ecostream_energy"]
+                    )
+                    energy_saved_pct = (
+                        (joules_saved / current_telemetry["cum_baseline_energy"]) * 100.0
+                        if current_telemetry["cum_baseline_energy"] > 0
+                        else 0.0
+                    )
+
+                    current_telemetry["carbon_intensity"] = current_carbon
+                    current_telemetry["vehicle_count"] = cached_count
+                    current_telemetry["active_model"] = cached_model_tag
+                    current_telemetry["model_memory_address"] = (
+                        hex(id(active_model)) if active_model else "0x000000000000"
+                    )
+                    current_telemetry["state"] = cached_state
+                    current_telemetry["latency_ms"] = elapsed_ms
+                    current_telemetry["power_watts"] = est_power
+                    current_telemetry["energy_saved_pct"] = energy_saved_pct
+                    current_telemetry["xai_explanation"] = explanation
+
+            # 4. In-Video Overlays & Bounding Boxes
+            cv2.rectangle(frame, (2, 2), (637, 357), cached_color, 2)
+            for xyxy in cached_boxes:
+                cv2.rectangle(frame, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), cached_color, 2)
+
+            # In-video HUD box
+            active_ptr = hex(id(model_heavy if "Heavy" in cached_model_tag else model_light))[-6:] if (model_heavy or model_light) else "000000"
+            cv2.rectangle(frame, (10, 10), (330, 60), (15, 20, 30), -1)
+            cv2.rectangle(frame, (10, 10), (330, 60), cached_color, 1)
+            cv2.putText(
+                frame,
+                f"CORE: {cached_model_tag.split()[0]} [0x{active_ptr}]",
+                (20, 32),
+                cv2.FONT_HERSHEY_DUPLEX,
+                0.52,
+                cached_color,
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                f"STATE: {cached_state}",
+                (20, 52),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                (200, 220, 240),
+                1,
+                cv2.LINE_AA,
+            )
+
+            # 5. JPEG Frame Encoding
+            ret_enc, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            if ret_enc:
+                with self.lock:
+                    self.latest_jpeg_bytes = buffer.tobytes()
+
+            # Maintain smooth ~30 FPS frame pacing
+            time.sleep(0.018)
+
+        if cap:
+            cap.release()
+
+
+# Single background worker instance
+stream_worker = VideoStreamWorker(VIDEO_PATH)
+
+
+@app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(
+        HTML_TEMPLATE,
+        carbon_high=CARBON_HIGH,
+        carbon_low=CARBON_LOW,
+        y_min=100,
+        y_max=400,
+        heavy_power_w=HEAVY_POWER_W,
+        eco_power_w=ECO_POWER_W,
+        power_saved_pct=POWER_SAVED_PCT,
+    )
 
-@app.route('/video_feed')
+
+def stream_generator():
+    """Stream latest frame from memory buffer to client."""
+    while True:
+        with stream_worker.lock:
+            frame_bytes = stream_worker.latest_jpeg_bytes
+
+        if frame_bytes is not None:
+            yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+        time.sleep(0.033)  # Deliver at ~30 FPS
+
+
+@app.route("/video_feed")
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(stream_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-@app.route('/telemetry')
+
+@app.route("/fallback_frame")
+def fallback_frame():
+    """Return an informative offline frame if stream drops or video is missing."""
+    img = np.zeros((360, 640, 3), dtype=np.uint8)
+    img[:] = (15, 20, 30)
+    cv2.putText(
+        img,
+        "ECOSTREAM STREAM STANDBY",
+        (130, 150),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.8,
+        (240, 240, 240),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        "No video found in data/ (sample_video.mp4)",
+        (120, 195),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (148, 163, 184),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        "Place a video in data/sample_video.mp4 to stream",
+        (115, 230),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (56, 189, 248),
+        1,
+        cv2.LINE_AA,
+    )
+    _, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
+@app.route("/telemetry")
 def telemetry():
-    return jsonify(current_telemetry)
+    with telemetry_lock:
+        return jsonify(current_telemetry)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+
+if __name__ == "__main__":
+    host = os.environ.get("ECOSTREAM_HOST", DEFAULT_HOST)
+    port = int(os.environ.get("ECOSTREAM_PORT", DEFAULT_PORT))
+
+    logger.info("Starting EcoStream background streaming worker...")
+    stream_worker.start()
+
+    logger.info("Starting EcoStream web server on http://%s:%d", host, port)
+    app.run(host=host, port=port, debug=False, threaded=True)
