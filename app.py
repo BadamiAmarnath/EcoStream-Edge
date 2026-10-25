@@ -547,6 +547,7 @@ class AsyncInferenceWorker(threading.Thread):
                 )
                 current_telemetry["vehicle_count"] = len(boxes)
                 current_telemetry["active_model"] = mode_meta["model_tag"]
+                current_telemetry["active_model_params"] = "25.9M" if mode_meta["model_key"] == "heavy" else "3.2M"
                 current_telemetry["model_memory_address"] = (
                     hex(id(active_model)) if active_model else "0x000000000000"
                 )
