@@ -30,7 +30,7 @@ flowchart TD
         E --> H[JPEG Frame Buffer + In-Video HUD]
         F --> H
         G --> H
-        H --> I[Non-Blocking Web Stream /video_feed]
+        H --> I["Non-Blocking Web Stream /video_feed/#lt;scenario_id#gt;"]
         C --> J[Live Telemetry State /telemetry]
         C --> K[(Decision Audit Log logs/decisions.csv)]
     end
@@ -128,6 +128,26 @@ To run the headless CLI controller:
 ```bash
 python main_controller.py
 ```
+
+### 7. Web Endpoints
+
+| Route | Description |
+|---|---|
+| `/` | Scenario selector |
+| `/scenario/<scenario_id>` | Live dashboard for one scenario |
+| `/video_feed/<scenario_id>` | MJPEG video stream with in-video HUD |
+| `/telemetry/<scenario_id>` | JSON telemetry for one scenario |
+| `/telemetry` | JSON telemetry for `traffic_demo` (backward compatible) |
+| `/fallback_frame` | Static standby JPEG frame |
+
+Available scenarios:
+
+| `scenario_id` | Name | Video file |
+|---|---|---|
+| `traffic_demo` | Traffic Flow Analytics | `data/sample_video.mp4` |
+| `retail_store` | Retail Store Footfall | `data/scenario2_retail.mp4` |
+
+Example: [http://127.0.0.1:5000/video_feed/traffic_demo](http://127.0.0.1:5000/video_feed/traffic_demo)
 
 ---
 
